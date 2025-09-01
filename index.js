@@ -6,7 +6,8 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const path = require('path');
 const multer = require('multer');
-const fs = require('fs'); // Modul File System untuk menghapus file
+const fs = require('fs');
+const ExcelJS = require('exceljs');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -21,7 +22,11 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 // --- Middleware ---
-const corsOptions = { origin: 'http://127.0.0.1:5500', optionsSuccessStatus: 200 };
+const corsOptions = {
+    origin: 'http://127.0.0.1:5500',
+    exposedHeaders: ['Content-Disposition'],
+    optionsSuccessStatus: 200
+};
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -114,8 +119,25 @@ app.get('/api/dashboard/stats', async (req, res) => {
 // =================================================================
 app.get('/api/kategori', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM kategori ORDER BY id_kategori ASC');
+        const searchTerm = req.query.search || '';
+        const result = await pool.query('SELECT * FROM kategori WHERE nama_kategori ILIKE $1 ORDER BY id_kategori ASC', [`%${searchTerm}%`]);
         res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/kategori/export', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM kategori ORDER BY id_kategori ASC');
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Kategori');
+        worksheet.columns = [
+            { header: 'ID Kategori', key: 'id_kategori', width: 15 },
+            { header: 'Nama Kategori', key: 'nama_kategori', width: 30 },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="kategori.xlsx"');
+        await workbook.xlsx.write(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -147,8 +169,28 @@ app.put('/api/kategori/:id', async (req, res) => {
 // =================================================================
 app.get('/api/client', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM client ORDER BY id_client ASC');
+        const searchTerm = req.query.search || '';
+        const query = 'SELECT * FROM client WHERE nama_brand ILIKE $1 OR nama_pt ILIKE $1 ORDER BY id_client ASC';
+        const result = await pool.query(query, [`%${searchTerm}%`]);
         res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/client/export', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM client ORDER BY id_client ASC');
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Clients');
+        worksheet.columns = [
+            { header: 'ID Client', key: 'id_client', width: 10 },
+            { header: 'Nama Brand', key: 'nama_brand', width: 30 },
+            { header: 'Nama PT', key: 'nama_pt', width: 30 },
+            { header: 'Alamat', key: 'alamat', width: 50 },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="clients.xlsx"');
+        await workbook.xlsx.write(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -176,15 +218,23 @@ app.put('/api/client/:id', async (req, res) => {
 });
 
 // =================================================================
-// API ENDPOINTS: VENDOR
+// API ENDPOINTS: VENDOR (DIMODIFIKASI TOTAL)
 // =================================================================
 app.get('/api/vendor', async (req, res) => {
     try {
-        const query = `
-            SELECT v.*, k.nama_kategori 
-            FROM vendor v LEFT JOIN kategori k ON v.id_kategori = k.id_kategori
+        const searchTerm = req.query.search || '';
+        // Query dimodifikasi untuk menggabungkan banyak kategori menjadi satu string
+        const searchQuery = `
+            SELECT 
+                v.*, 
+                STRING_AGG(k.nama_kategori, ', ') AS kategori_list
+            FROM vendor v
+            LEFT JOIN vendor_kategori_junction j ON v.id_vendor = j.id_vendor
+            LEFT JOIN kategori k ON j.id_kategori = k.id_kategori
+            WHERE v.nama_pt_cv ILIKE $1 OR v.nama_vendor ILIKE $1
+            GROUP BY v.id_vendor
             ORDER BY v.id_vendor ASC`;
-        const result = await pool.query(query);
+        const result = await pool.query(searchQuery, [`%${searchTerm}%`]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -194,6 +244,12 @@ app.get('/api/vendor/:id', async (req, res) => {
         const vendorResult = await pool.query('SELECT * FROM vendor WHERE id_vendor = $1', [req.params.id]);
         if (vendorResult.rows.length === 0) return res.status(404).json({ message: 'Vendor tidak ditemukan' });
         
+        // Ambil daftar kategori yang terhubung dengan vendor ini
+        const kategoriResult = await pool.query(`
+            SELECT k.id_kategori FROM kategori k
+            JOIN vendor_kategori_junction j ON k.id_kategori = j.id_kategori
+            WHERE j.id_vendor = $1`, [req.params.id]);
+
         const attachmentsResult = await pool.query(
             "SELECT id_attachment, file_path FROM attachments WHERE related_table = 'vendor' AND related_id_int = $1 ORDER BY uploaded_at DESC",
             [req.params.id]
@@ -201,48 +257,79 @@ app.get('/api/vendor/:id', async (req, res) => {
         
         const vendorData = vendorResult.rows[0];
         vendorData.attachments = attachmentsResult.rows;
+        // Kirim ID kategori sebagai array angka, misal: [1, 3]
+        vendorData.kategori_ids = kategoriResult.rows.map(r => r.id_kategori);
         
         res.json(vendorData);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/vendor', upload.array('attachments', 10), async (req, res) => {
-    const { nama_pt_cv, nama_vendor, id_kategori, alamat, no_pic, nama_pic, status_verifikasi } = req.body;
-    const query = `
-        INSERT INTO vendor (nama_pt_cv, nama_vendor, id_kategori, alamat, no_pic, nama_pic, status_verifikasi)
-        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id_vendor`;
+    const client = await pool.connect();
     try {
-        const result = await pool.query(query, [nama_pt_cv, nama_vendor, id_kategori, alamat, no_pic, nama_pic, status_verifikasi]);
-        const newVendorId = result.rows[0].id_vendor;
-        await saveAttachments(req.files, 'vendor', newVendorId);
+        await client.query('BEGIN'); // Mulai transaksi
+        const { nama_pt_cv, nama_vendor, alamat, no_pic, nama_pic, status_verifikasi, kategori_ids } = req.body;
+        
+        const vendorQuery = `
+            INSERT INTO vendor (nama_pt_cv, nama_vendor, alamat, no_pic, nama_pic, status_verifikasi)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id_vendor`;
+        const vendorResult = await client.query(vendorQuery, [nama_pt_cv, nama_vendor, alamat, no_pic, nama_pic, status_verifikasi]);
+        const newVendorId = vendorResult.rows[0].id_vendor;
+
+        // Simpan kategori-kategori yang dipilih ke tabel junction
+        if (kategori_ids && kategori_ids.length > 0) {
+            const kategoriQuery = 'INSERT INTO vendor_kategori_junction (id_vendor, id_kategori) VALUES ($1, $2)';
+            // Pastikan kategori_ids adalah array
+            const ids = Array.isArray(kategori_ids) ? kategori_ids : [kategori_ids];
+            for (const catId of ids) {
+                await client.query(kategoriQuery, [newVendorId, catId]);
+            }
+        }
+        
+        await saveAttachments(req.files, 'vendor', newVendorId); // Helper function ini ada di kode Anda sebelumnya
+
+        await client.query('COMMIT'); // Selesaikan transaksi
         res.status(201).json({ id_vendor: newVendorId, message: 'Vendor berhasil dibuat' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await client.query('ROLLBACK'); // Batalkan jika ada error
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
 });
 
 app.put('/api/vendor/:id', upload.array('attachments', 10), async (req, res) => {
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
         const id = parseInt(req.params.id, 10);
-        const oldDataResult = await pool.query('SELECT * FROM vendor WHERE id_vendor = $1', [id]);
-        const oldData = oldDataResult.rows[0];
+        const { nama_pt_cv, status_verifikasi, nama_vendor, alamat, no_pic, nama_pic, kategori_ids } = req.body;
 
-        const updatedData = {
-            nama_pt_cv: req.body.nama_pt_cv || oldData.nama_pt_cv,
-            status_verifikasi: req.body.status_verifikasi || oldData.status_verifikasi,
-            nama_vendor: req.body.nama_vendor || oldData.nama_vendor,
-            id_kategori: req.body.id_kategori || oldData.id_kategori,
-            alamat: req.body.alamat || oldData.alamat,
-            no_pic: req.body.no_pic || oldData.no_pic,
-            nama_pic: req.body.nama_pic || oldData.nama_pic,
-        };
-
-        const query = 'UPDATE vendor SET nama_pt_cv = $1, status_verifikasi = $2, nama_vendor=$3, id_kategori=$4, alamat=$5, no_pic=$6, nama_pic=$7 WHERE id_vendor = $8';
-        const values = [...Object.values(updatedData), id];
-        await pool.query(query, values);
+        const query = 'UPDATE vendor SET nama_pt_cv = $1, status_verifikasi = $2, nama_vendor=$3, alamat=$4, no_pic=$5, nama_pic=$6 WHERE id_vendor = $7';
+        await client.query(query, [nama_pt_cv, status_verifikasi, nama_vendor, alamat, no_pic, nama_pic, id]);
+        
+        // Hapus semua relasi kategori lama
+        await client.query('DELETE FROM vendor_kategori_junction WHERE id_vendor = $1', [id]);
+        
+        // Tambahkan relasi kategori yang baru
+        if (kategori_ids && kategori_ids.length > 0) {
+            const kategoriQuery = 'INSERT INTO vendor_kategori_junction (id_vendor, id_kategori) VALUES ($1, $2)';
+            const ids = Array.isArray(kategori_ids) ? kategori_ids : [kategori_ids];
+            for (const catId of ids) {
+                await client.query(kategoriQuery, [id, catId]);
+            }
+        }
         
         await saveAttachments(req.files, 'vendor', id);
         
+        await client.query('COMMIT');
         res.status(200).json({ message: 'Vendor berhasil diperbarui' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
 });
 
 // =================================================================
@@ -250,14 +337,39 @@ app.put('/api/vendor/:id', upload.array('attachments', 10), async (req, res) => 
 // =================================================================
 app.get('/api/po', async (req, res) => {
     try {
+        const searchTerm = req.query.search || '';
         const query = `
             SELECT po.*, v.nama_pt_cv AS nama_vendor, c.nama_brand AS nama_client
             FROM purchase_order po
             LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
             LEFT JOIN client c ON po.id_client = c.id_client
+            WHERE po.no_po ILIKE $1 OR po.perihal_project ILIKE $1 OR v.nama_pt_cv ILIKE $1
             ORDER BY po.tanggal_po DESC`;
-        const result = await pool.query(query);
+        const result = await pool.query(query, [`%${searchTerm}%`]);
         res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/po/export', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT po.no_po, po.perihal_project, v.nama_pt_cv AS nama_vendor, po.nominal, po.status_po, po.tanggal_po
+            FROM purchase_order po LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
+            ORDER BY po.tanggal_po DESC`);
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Purchase Orders');
+        worksheet.columns = [
+            { header: 'No. PO', key: 'no_po', width: 25 },
+            { header: 'Perihal Project', key: 'perihal_project', width: 40 },
+            { header: 'Nama Vendor', key: 'nama_vendor', width: 30 },
+            { header: 'Nominal', key: 'nominal', width: 20, style: { numFmt: '"Rp"#,##0.00' } },
+            { header: 'Status', key: 'status_po', width: 15 },
+            { header: 'Tanggal PO', key: 'tanggal_po', width: 15, style: { numFmt: 'dd/mm/yyyy' } },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="purchase_orders.xlsx"');
+        await workbook.xlsx.write(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -322,13 +434,35 @@ app.put('/api/po/:id', upload.array('attachments', 10), async (req, res) => {
 // =================================================================
 app.get('/api/memo', async (req, res) => {
     try {
+        const searchTerm = req.query.search || '';
         const query = `
             SELECT m.*, c.nama_brand, c.nama_pt 
             FROM memo_procurement m
             LEFT JOIN client c ON m.id_client = c.id_client
+            WHERE m.no_memo ILIKE $1 OR m.perihal ILIKE $1 OR c.nama_brand ILIKE $1
             ORDER BY m.no_memo ASC`;
-        const result = await pool.query(query);
+        const result = await pool.query(query, [`%${searchTerm}%`]);
         res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/memo/export', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT m.no_memo, m.perihal, c.nama_brand
+            FROM memo_procurement m LEFT JOIN client c ON m.id_client = c.id_client
+            ORDER BY m.no_memo ASC`);
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Memos');
+        worksheet.columns = [
+            { header: 'No. Memo', key: 'no_memo', width: 25 },
+            { header: 'Perihal', key: 'perihal', width: 50 },
+            { header: 'Client', key: 'nama_brand', width: 30 },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="memos.xlsx"');
+        await workbook.xlsx.write(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -383,6 +517,7 @@ app.put('/api/memo/:id', upload.array('attachments', 10), async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
 // =================================================================
 // API ENDPOINTS: INVOICE
 // =================================================================
@@ -396,13 +531,40 @@ const calculateInvoiceDetails = (invoice, nominal_po) => {
 
 app.get('/api/invoice', async (req, res) => {
     try {
+        const searchTerm = req.query.search || '';
+        const query = `
+            SELECT i.*, po.nominal AS nominal_po
+            FROM invoice i JOIN purchase_order po ON i.no_po = po.no_po
+            WHERE i.no_invoice ILIKE $1 OR i.no_po ILIKE $1
+            ORDER BY i.id_invoice ASC`;
+        const result = await pool.query(query, [`%${searchTerm}%`]);
+        const invoicesWithCalculation = result.rows.map(inv => calculateInvoiceDetails(inv, inv.nominal_po));
+        res.json(invoicesWithCalculation);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/invoice/export', async (req, res) => {
+    try {
         const query = `
             SELECT i.*, po.nominal AS nominal_po
             FROM invoice i JOIN purchase_order po ON i.no_po = po.no_po
             ORDER BY i.id_invoice ASC`;
         const result = await pool.query(query);
         const invoicesWithCalculation = result.rows.map(inv => calculateInvoiceDetails(inv, inv.nominal_po));
-        res.json(invoicesWithCalculation);
+
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Invoices');
+        worksheet.columns = [
+            { header: 'No. Invoice', key: 'no_invoice', width: 25 },
+            { header: 'No. PO', key: 'no_po', width: 25 },
+            { header: 'Status Invoice', key: 'status_invoice', width: 15 },
+            { header: 'Termin', key: 'termin', width: 10 },
+            { header: 'Grand Total', key: 'grand_total', width: 20, style: { numFmt: '"Rp"#,##0.00' } },
+        ];
+        worksheet.addRows(invoicesWithCalculation);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="invoices.xlsx"');
+        await workbook.xlsx.write(res);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
