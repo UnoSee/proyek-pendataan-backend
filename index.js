@@ -1,4 +1,4 @@
-// index.js (Final dengan Perbaikan Upload Middleware)
+// index.js (Backend Final & Lengkap dengan Semua Perbaikan)
 
 require('dotenv').config();
 const express = require('express');
@@ -20,18 +20,17 @@ const storage = multer.diskStorage({
     }
 });
 
-// ### PERBAIKAN 1: Middleware upload kini menangani semua jenis file ###
 const upload = multer({ storage: storage }).fields([
-    // File spesifik untuk Vendor
-    { name: 'npwp_file', maxCount: 1 },
-    { name: 'ktp_direktur_file', maxCount: 1 },
-    { name: 'surat_pernyataan_file', maxCount: 1 },
-    { name: 'akte_file', maxCount: 1 },
+    // Vendor
+    { name: 'npwp_file', maxCount: 1 }, { name: 'ktp_direktur_file', maxCount: 1 },
+    { name: 'surat_pernyataan_file', maxCount: 1 }, { name: 'akte_file', maxCount: 1 },
     { name: 'nib_file', maxCount: 1 },
-    // File umum untuk PO dan Memo, 'attachments' harus cocok dengan nama <input> di frontend
+    // PO
+    { name: 'dokumen_po', maxCount: 1 }, { name: 'pcp_rab', maxCount: 1 },
+    { name: 'fpb', maxCount: 1 }, { name: 'sph_vendor', maxCount: 1 },
+    // Umum
     { name: 'attachments', maxCount: 10 }
 ]);
-
 
 // --- Middleware ---
 const corsOptions = {
@@ -52,16 +51,15 @@ const pool = new Pool({
     port: process.env.DB_PORT,
 });
 
-// ### PERBAIKAN 2: Helper Function diperbarui untuk menangani req.files sebagai objek ###
+// --- Helper Function ---
 const saveAttachments = async (files, related_table, related_id) => {
     if (!files) return;
-
     const isTextId = typeof related_id === 'string';
     const query = `
         INSERT INTO attachments (file_path, document_type, related_table, related_id_text, related_id_int) 
         VALUES ($1, $2, $3, $4, $5)`;
-
-    for (const fieldName in files) { // Loop melalui nama field (e.g., 'attachments', 'npwp_file')
+    for (const fieldName in files) {
+        if (!fieldName.endsWith('_file') && fieldName !== 'attachments') continue;
         const fileArray = files[fieldName];
         for (const file of fileArray) {
             const document_type = fieldName.toUpperCase();
@@ -86,15 +84,12 @@ app.delete('/api/attachments/:id', async (req, res) => {
             throw new Error('Attachment tidak ditemukan.');
         }
         const filePath = fileResult.rows[0].file_path;
-
         await client.query('DELETE FROM attachments WHERE id_attachment = $1', [req.params.id]);
-
         const fullPath = path.join(__dirname, 'uploads', filePath);
         fs.unlink(fullPath, (err) => {
             if (err) console.error("Gagal menghapus file dari server:", err);
             else console.log("File berhasil dihapus dari server:", fullPath);
         });
-
         await client.query('COMMIT');
         res.status(200).json({ message: 'Attachment berhasil dihapus' });
     } catch (err) {
@@ -114,8 +109,10 @@ app.get('/api/dashboard/stats', async (req, res) => {
         const paidInvoiceQuery = pool.query("SELECT COUNT(*) FROM invoice WHERE status_invoice = 'Paid'");
         const pendingInvoiceQuery = pool.query("SELECT COUNT(*) FROM invoice WHERE status_invoice IN ('Bill', 'Unbill')");
         const recentPoQuery = pool.query(`
-            SELECT po.no_po, po.perihal_project, v.nama_pt_cv AS nama_vendor, po.nominal
-            FROM purchase_order po JOIN vendor v ON po.id_vendor = v.id_vendor
+            SELECT po.no_po, p.nama_project, v.nama_pt_cv AS nama_vendor, po.nominal
+            FROM purchase_order po 
+            JOIN vendor v ON po.id_vendor = v.id_vendor
+            LEFT JOIN project p ON po.id_project = p.id_project
             ORDER BY po.tanggal_po DESC LIMIT 5`);
 
         const [poResult, paidInvoiceResult, pendingInvoiceResult, recentPoResult] = await Promise.all([
@@ -236,6 +233,57 @@ app.put('/api/client/:id', async (req, res) => {
 });
 
 // =================================================================
+// API ENDPOINTS: PROJECT
+// =================================================================
+app.get('/api/project', async (req, res) => {
+    try {
+        const searchTerm = req.query.search || '';
+        const result = await pool.query('SELECT * FROM project WHERE nama_project ILIKE $1 OR kategori_project ILIKE $1 ORDER BY id_project ASC', [`%${searchTerm}%`]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/project/export', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM project ORDER BY id_project ASC');
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Projects');
+        worksheet.columns = [
+            { header: 'ID Project', key: 'id_project', width: 15 },
+            { header: 'Nama Project', key: 'nama_project', width: 40 },
+            { header: 'Kategori Project', key: 'kategori_project', width: 25 },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="projects.xlsx"');
+        await workbook.xlsx.write(res);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/project/:id', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM project WHERE id_project = $1', [req.params.id]);
+        res.json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/project', async (req, res) => {
+    try {
+        const { nama_project, kategori_project } = req.body;
+        const result = await pool.query('INSERT INTO project (nama_project, kategori_project) VALUES ($1, $2) RETURNING *', [nama_project, kategori_project]);
+        res.status(201).json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/project/:id', async (req, res) => {
+    try {
+        const { nama_project, kategori_project } = req.body;
+        const result = await pool.query('UPDATE project SET nama_project = $1, kategori_project = $2 WHERE id_project = $3 RETURNING *', [nama_project, kategori_project, req.params.id]);
+        res.json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// =================================================================
 // API ENDPOINTS: VENDOR
 // =================================================================
 const REQUIRED_DOCS = ['NPWP_FILE', 'KTP_DIREKTUR_FILE', 'SURAT_PERNYATAAN_FILE', 'AKTE_FILE', 'NIB_FILE'];
@@ -287,7 +335,7 @@ app.get('/api/vendor/:id', async (req, res) => {
     try {
         const vendorResult = await pool.query('SELECT * FROM vendor WHERE id_vendor = $1', [req.params.id]);
         if (vendorResult.rows.length === 0) return res.status(404).json({ message: 'Vendor tidak ditemukan' });
-
+        
         const kategoriResult = await pool.query(`
             SELECT k.id_kategori FROM kategori k
             JOIN vendor_kategori_junction j ON k.id_kategori = j.id_kategori
@@ -297,11 +345,11 @@ app.get('/api/vendor/:id', async (req, res) => {
             "SELECT id_attachment, file_path, document_type FROM attachments WHERE related_table = 'vendor' AND related_id_int = $1 ORDER BY uploaded_at DESC",
             [req.params.id]
         );
-
+        
         const vendorData = vendorResult.rows[0];
         vendorData.attachments = attachmentsResult.rows;
         vendorData.kategori_ids = kategoriResult.rows.map(r => r.id_kategori);
-
+        
         res.json(vendorData);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -311,7 +359,7 @@ app.post('/api/vendor', upload, async (req, res) => {
     try {
         await client.query('BEGIN');
         const { nama_pt_cv, nama_vendor, alamat, nama_pic, nomor_pic, kategori_ids } = req.body;
-
+        
         const vendorQuery = `
             INSERT INTO vendor (nama_pt_cv, nama_vendor, alamat, nama_pic, nomor_pic, status_verifikasi)
             VALUES ($1, $2, $3, $4, $5, 'Belum terverifikasi') RETURNING id_vendor`;
@@ -319,22 +367,20 @@ app.post('/api/vendor', upload, async (req, res) => {
         const newVendorId = vendorResult.rows[0].id_vendor;
 
         await saveAttachments(req.files, 'vendor', newVendorId);
-
+        
         const checkDocsQuery = `SELECT document_type FROM attachments WHERE related_table = 'vendor' AND related_id_int = $1`;
         const attachments = await client.query(checkDocsQuery, [newVendorId]);
         const uploadedDocTypes = attachments.rows.map(r => r.document_type);
-
+        
         let docCount = 0;
         REQUIRED_DOCS.forEach(doc => {
-            if (uploadedDocTypes.includes(doc)) {
-                docCount++;
-            }
+            if(uploadedDocTypes.includes(doc)) docCount++;
         });
 
         if (docCount === REQUIRED_DOCS.length) {
             await client.query(`UPDATE vendor SET status_verifikasi = 'Terverifikasi' WHERE id_vendor = $1`, [newVendorId]);
         }
-
+        
         if (kategori_ids) {
             const ids = Array.isArray(kategori_ids) ? kategori_ids : [kategori_ids];
             for (const catId of ids) {
@@ -364,16 +410,14 @@ app.put('/api/vendor/:id', upload, async (req, res) => {
         const { nama_pt_cv, nama_vendor, alamat, nama_pic, nomor_pic, kategori_ids } = req.body;
 
         await saveAttachments(req.files, 'vendor', id);
-
+        
         const checkDocsQuery = `SELECT document_type FROM attachments WHERE related_table = 'vendor' AND related_id_int = $1`;
         const attachments = await client.query(checkDocsQuery, [id]);
         const uploadedDocTypes = attachments.rows.map(r => r.document_type);
-
+        
         let docCount = 0;
         REQUIRED_DOCS.forEach(doc => {
-            if (uploadedDocTypes.includes(doc)) {
-                docCount++;
-            }
+            if(uploadedDocTypes.includes(doc)) docCount++;
         });
 
         const status_verifikasi = (docCount === REQUIRED_DOCS.length) ? 'Terverifikasi' : 'Belum terverifikasi';
@@ -382,7 +426,7 @@ app.put('/api/vendor/:id', upload, async (req, res) => {
             nama_pt_cv = $1, nama_vendor = $2, alamat = $3, nama_pic = $4, nomor_pic = $5, status_verifikasi = $6
             WHERE id_vendor = $7`;
         await client.query(query, [nama_pt_cv, nama_vendor, alamat, nama_pic, nomor_pic, status_verifikasi, id]);
-
+        
         await client.query('DELETE FROM vendor_kategori_junction WHERE id_vendor = $1', [id]);
         if (kategori_ids) {
             const ids = Array.isArray(kategori_ids) ? kategori_ids : [kategori_ids];
@@ -390,7 +434,7 @@ app.put('/api/vendor/:id', upload, async (req, res) => {
                 await client.query('INSERT INTO vendor_kategori_junction (id_vendor, id_kategori) VALUES ($1, $2)', [id, catId]);
             }
         }
-
+        
         await client.query('COMMIT');
         res.status(200).json({ message: 'Vendor berhasil diperbarui' });
     } catch (err) {
@@ -402,17 +446,104 @@ app.put('/api/vendor/:id', upload, async (req, res) => {
 });
 
 // =================================================================
+// API ENDPOINTS: MEMO
+// =================================================================
+app.get('/api/memo', async (req, res) => {
+    try {
+        const searchTerm = req.query.search || '';
+        const query = `
+            SELECT m.*, c.nama_brand, p.nama_project
+            FROM memo_procurement m
+            LEFT JOIN client c ON m.id_client = c.id_client
+            LEFT JOIN project p ON m.id_project = p.id_project
+            WHERE m.no_memo ILIKE $1 OR m.perihal ILIKE $1 OR c.nama_brand ILIKE $1 OR m.user_internal ILIKE $1 OR p.nama_project ILIKE $1
+            ORDER BY m.no_memo ASC`;
+        const result = await pool.query(query, [`%${searchTerm}%`]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/memo/export', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT m.no_memo, m.perihal, c.nama_brand, p.nama_project, m.user_internal
+            FROM memo_procurement m 
+            LEFT JOIN client c ON m.id_client = c.id_client
+            LEFT JOIN project p ON m.id_project = p.id_project
+            ORDER BY m.no_memo ASC`);
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Memos');
+        worksheet.columns = [
+            { header: 'No. Memo', key: 'no_memo', width: 25 },
+            { header: 'Perihal', key: 'perihal', width: 50 },
+            { header: 'Client', key: 'nama_brand', width: 30 },
+            { header: 'Project', key: 'nama_project', width: 30 },
+            { header: 'User Internal', key: 'user_internal', width: 25 },
+        ];
+        worksheet.addRows(result.rows);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="memos.xlsx"');
+        await workbook.xlsx.write(res);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/memo/:id', async (req, res) => {
+     try {
+        const decodedId = decodeURIComponent(req.params.id);
+        const memoResult = await pool.query('SELECT * FROM memo_procurement WHERE no_memo = $1', [decodedId]);
+        if (memoResult.rows.length === 0) return res.status(404).json({ message: 'Memo tidak ditemukan' });
+
+        const attachmentsResult = await pool.query(
+            "SELECT id_attachment, file_path, document_type FROM attachments WHERE related_table = 'memo' AND related_id_text = $1 ORDER BY uploaded_at DESC",
+            [decodedId]
+        );
+        
+        const memoData = memoResult.rows[0];
+        memoData.attachments = attachmentsResult.rows;
+        
+        res.json(memoData);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/memo', upload, async (req, res) => {
+    const { no_memo, id_client, perihal, user_internal, id_project } = req.body;
+    const query = `
+        INSERT INTO memo_procurement (no_memo, id_client, perihal, user_internal, id_project) 
+        VALUES ($1, $2, $3, $4, $5) RETURNING no_memo`;
+    try {
+        const result = await pool.query(query, [no_memo, id_client, perihal, user_internal, id_project]);
+        const newMemoId = result.rows[0].no_memo;
+        await saveAttachments(req.files, 'memo', newMemoId);
+        res.status(201).json({ no_memo: newMemoId, message: 'Memo berhasil dibuat' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/memo/:id', upload, async (req, res) => {
+    try {
+        const id = decodeURIComponent(req.params.id);
+        const { perihal, user_internal, id_project, id_client } = req.body;
+        
+        const query = 'UPDATE memo_procurement SET perihal = $1, user_internal = $2, id_project = $3, id_client=$4 WHERE no_memo = $5';
+        await pool.query(query, [ perihal, user_internal, id_project, id_client, id ]);
+        
+        await saveAttachments(req.files, 'memo', id);
+        res.status(200).json({ message: 'Memo berhasil diperbarui' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// =================================================================
 // API ENDPOINTS: PO
 // =================================================================
 app.get('/api/po', async (req, res) => {
     try {
         const searchTerm = req.query.search || '';
         const query = `
-            SELECT po.*, v.nama_pt_cv AS nama_vendor, c.nama_brand AS nama_client
+            SELECT po.*, v.nama_pt_cv AS nama_vendor, c.nama_brand AS nama_client, p.nama_project
             FROM purchase_order po
             LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
             LEFT JOIN client c ON po.id_client = c.id_client
-            WHERE po.no_po ILIKE $1 OR po.perihal_project ILIKE $1 OR v.nama_pt_cv ILIKE $1
+            LEFT JOIN project p ON po.id_project = p.id_project
+            WHERE po.no_po ILIKE $1 OR v.nama_pt_cv ILIKE $1 OR p.nama_project ILIKE $1
             ORDER BY po.tanggal_po DESC`;
         const result = await pool.query(query, [`%${searchTerm}%`]);
         res.json(result.rows);
@@ -422,14 +553,16 @@ app.get('/api/po', async (req, res) => {
 app.get('/api/po/export', async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT po.no_po, po.perihal_project, v.nama_pt_cv AS nama_vendor, po.nominal, po.status_po, po.tanggal_po
-            FROM purchase_order po LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
+            SELECT po.no_po, p.nama_project, v.nama_pt_cv AS nama_vendor, po.nominal, po.status_po, po.tanggal_po
+            FROM purchase_order po 
+            LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
+            LEFT JOIN project p ON po.id_project = p.id_project
             ORDER BY po.tanggal_po DESC`);
         const workbook = new ExcelJS.Workbook();
         const worksheet = workbook.addWorksheet('Purchase Orders');
         worksheet.columns = [
             { header: 'No. PO', key: 'no_po', width: 25 },
-            { header: 'Perihal Project', key: 'perihal_project', width: 40 },
+            { header: 'Project', key: 'nama_project', width: 40 },
             { header: 'Nama Vendor', key: 'nama_vendor', width: 30 },
             { header: 'Nominal', key: 'nominal', width: 20, style: { numFmt: '"Rp"#,##0.00' } },
             { header: 'Status', key: 'status_po', width: 15 },
@@ -445,128 +578,89 @@ app.get('/api/po/export', async (req, res) => {
 app.get('/api/po/:id', async (req, res) => {
     try {
         const decodedId = decodeURIComponent(req.params.id);
-        const poResult = await pool.query('SELECT * FROM purchase_order WHERE no_po = $1', [decodedId]);
+        const poResult = await pool.query(`
+            SELECT po.*, v.nama_pt_cv AS nama_vendor, c.nama_brand AS nama_client, p.nama_project
+            FROM purchase_order po
+            LEFT JOIN vendor v ON po.id_vendor = v.id_vendor
+            LEFT JOIN client c ON po.id_client = c.id_client
+            LEFT JOIN project p ON po.id_project = p.id_project
+            WHERE po.no_po = $1`, [decodedId]);
         if (poResult.rows.length === 0) return res.status(404).json({ message: 'PO tidak ditemukan' });
 
-        const attachmentsResult = await pool.query(
-            "SELECT id_attachment, file_path, document_type FROM attachments WHERE related_table = 'po' AND related_id_text = $1 ORDER BY uploaded_at DESC",
-            [decodedId]
-        );
-
         const poData = poResult.rows[0];
-        poData.attachments = attachmentsResult.rows;
-
+        
+        if (poData.no_memo) {
+             const memoAttachments = await pool.query(
+                "SELECT file_path FROM attachments WHERE related_table = 'memo' AND related_id_text = $1 LIMIT 1",
+                [poData.no_memo]
+            );
+            if(memoAttachments.rows.length > 0) {
+                 poData.path_memo_user = memoAttachments.rows[0].file_path;
+            }
+        }
+        
         res.json(poData);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/po', upload, async (req, res) => {
-    const { no_po, id_vendor, id_client, no_memo, nominal, perihal_project, tanggal_po, status_po } = req.body;
-    const query = `
-        INSERT INTO purchase_order (no_po, id_vendor, id_client, no_memo, nominal, perihal_project, tanggal_po, status_po)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING no_po`;
+    const { no_po, id_vendor, id_client, no_memo, nominal, id_project, tanggal_po, status_po } = req.body;
+    const files = req.files || {};
     try {
-        const result = await pool.query(query, [no_po, id_vendor, id_client, no_memo, nominal, perihal_project, tanggal_po, status_po]);
-        const newPoId = result.rows[0].no_po;
-        await saveAttachments(req.files, 'po', newPoId);
-        res.status(201).json({ no_po: newPoId, message: 'PO berhasil dibuat' });
+        const memoRes = await pool.query('SELECT user_internal FROM memo_procurement WHERE no_memo = $1', [no_memo]);
+        const user_internal = memoRes.rows.length > 0 ? memoRes.rows[0].user_internal : null;
+
+        const path_dokumen_po = files.dokumen_po ? files.dokumen_po[0].filename : null;
+        const path_pcp_rab = files.pcp_rab ? files.pcp_rab[0].filename : null;
+        const path_fpb = files.fpb ? files.fpb[0].filename : null;
+        const path_sph_vendor = files.sph_vendor ? files.sph_vendor[0].filename : null;
+
+        const query = `
+            INSERT INTO purchase_order (
+                no_po, id_vendor, id_client, no_memo, nominal, id_project, tanggal_po, status_po, user_internal,
+                path_dokumen_po, path_pcp_rab, path_fpb, path_sph_vendor
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING no_po`;
+
+        await pool.query(query, [
+            no_po, id_vendor, id_client, no_memo, nominal, id_project, tanggal_po, status_po, user_internal,
+            path_dokumen_po, path_pcp_rab, path_fpb, path_sph_vendor
+        ]);
+        res.status(201).json({ no_po: no_po, message: 'PO berhasil dibuat' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/po/:id', upload, async (req, res) => {
     try {
         const id = decodeURIComponent(req.params.id);
-        const { perihal_project, nominal, status_po } = req.body;
-        
-        await pool.query('UPDATE purchase_order SET perihal_project = $1, nominal = $2, status_po = $3 WHERE no_po = $4',
-            [perihal_project, nominal, status_po, id]);
+        const { no_memo, id_project, nominal, status_po, id_vendor, id_client, tanggal_po } = req.body;
+        const files = req.files || {};
 
-        await saveAttachments(req.files, 'po', id);
+        const memoRes = await pool.query('SELECT user_internal FROM memo_procurement WHERE no_memo = $1', [no_memo]);
+        const user_internal = memoRes.rows.length > 0 ? memoRes.rows[0].user_internal : null;
+
+        const paths = {
+            path_dokumen_po: files.dokumen_po ? files.dokumen_po[0].filename : req.body.existing_dokumen_po,
+            path_pcp_rab: files.pcp_rab ? files.pcp_rab[0].filename : req.body.existing_pcp_rab,
+            path_fpb: files.fpb ? files.fpb[0].filename : req.body.existing_fpb,
+            path_sph_vendor: files.sph_vendor ? files.sph_vendor[0].filename : req.body.existing_sph_vendor
+        };
+
+        const query = `
+            UPDATE purchase_order SET 
+            no_memo = $1, id_project = $2, user_internal = $3, nominal = $4, status_po = $5,
+            id_vendor = $6, id_client = $7, tanggal_po = $8,
+            path_dokumen_po = $9, path_pcp_rab = $10, path_fpb = $11, path_sph_vendor = $12
+            WHERE no_po = $13`;
+        await pool.query(query, [
+            no_memo, id_project, user_internal, nominal, status_po,
+            id_vendor, id_client, tanggal_po,
+            paths.path_dokumen_po, paths.path_pcp_rab, paths.path_fpb, paths.path_sph_vendor,
+            id
+        ]);
+        
         res.status(200).json({ message: 'PO berhasil diperbarui' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
-
-// =================================================================
-// API ENDPOINTS: MEMO
-// =================================================================
-app.get('/api/memo', async (req, res) => {
-    try {
-        const searchTerm = req.query.search || '';
-        const query = `
-            SELECT m.*, c.nama_brand, c.nama_pt 
-            FROM memo_procurement m
-            LEFT JOIN client c ON m.id_client = c.id_client
-            WHERE m.no_memo ILIKE $1 OR m.perihal ILIKE $1 OR c.nama_brand ILIKE $1
-            ORDER BY m.no_memo ASC`;
-        const result = await pool.query(query, [`%${searchTerm}%`]);
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/memo/export', async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT m.no_memo, m.perihal, c.nama_brand
-            FROM memo_procurement m LEFT JOIN client c ON m.id_client = c.id_client
-            ORDER BY m.no_memo ASC`);
-        const workbook = new ExcelJS.Workbook();
-        const worksheet = workbook.addWorksheet('Memos');
-        worksheet.columns = [
-            { header: 'No. Memo', key: 'no_memo', width: 25 },
-            { header: 'Perihal', key: 'perihal', width: 50 },
-            { header: 'Client', key: 'nama_brand', width: 30 },
-        ];
-        worksheet.addRows(result.rows);
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', 'attachment; filename="memos.xlsx"');
-        await workbook.xlsx.write(res);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/memo/:id', async (req, res) => {
-    try {
-        const decodedId = decodeURIComponent(req.params.id);
-        const memoResult = await pool.query('SELECT * FROM memo_procurement WHERE no_memo = $1', [decodedId]);
-        if (memoResult.rows.length === 0) return res.status(404).json({ message: 'Memo tidak ditemukan' });
-
-        const attachmentsResult = await pool.query(
-            "SELECT id_attachment, file_path, document_type FROM attachments WHERE related_table = 'memo' AND related_id_text = $1 ORDER BY uploaded_at DESC",
-            [decodedId]
-        );
-
-        const memoData = memoResult.rows[0];
-        memoData.attachments = attachmentsResult.rows;
-
-        res.json(memoData);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/memo', upload, async (req, res) => {
-    const { no_memo, id_client, perihal } = req.body;
-    const query = `
-        INSERT INTO memo_procurement (no_memo, id_client, perihal) 
-        VALUES ($1, $2, $3) RETURNING no_memo`;
-    try {
-        const result = await pool.query(query, [no_memo, id_client, perihal]);
-        const newMemoId = result.rows[0].no_memo;
-        await saveAttachments(req.files, 'memo', newMemoId);
-        res.status(201).json({ no_memo: newMemoId, message: 'Memo berhasil dibuat' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.put('/api/memo/:id', upload, async (req, res) => {
-    try {
-        const id = decodeURIComponent(req.params.id);
-        const { perihal } = req.body;
-        
-        await pool.query('UPDATE memo_procurement SET perihal = $1 WHERE no_memo = $2', [ perihal, id ]);
-        
-        await saveAttachments(req.files, 'memo', id);
-        res.status(200).json({ message: 'Memo berhasil diperbarui' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 
 // =================================================================
 // API ENDPOINTS: INVOICE
@@ -646,7 +740,6 @@ app.put('/api/invoice/:id', async (req, res) => {
         res.json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
-
 
 // --- Jalankan Server ---
 app.listen(port, () => {
